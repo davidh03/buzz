@@ -1,0 +1,127 @@
+name: Deploy Buzz relay to EC2
+
+on:
+  workflow_run:
+    workflows: ["Docker image"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Published GHCR image tag, for example sha-abcdef0
+        required: true
+        type: string
+      source_sha:
+        description: Full 40-character source commit SHA for that image tag
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: buzz-production-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      ${{ vars.BUZZ_DEPLOY_ENABLED == 'true' &&
+          ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+           (github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main' &&
+            github.event.workflow_run.head_repository.full_name == github.repository)) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+      BUZZ_EC2_INSTANCE_ID: ${{ vars.BUZZ_EC2_INSTANCE_ID }}
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
+      MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
+    steps:
+      - name: Validate deployment settings and image tag
+        id: image
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$AWS_REGION"
+          test -n "$AWS_DEPLOY_ROLE_ARN"
+          test -n "$BUZZ_EC2_INSTANCE_ID"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            image_tag="$MANUAL_IMAGE_TAG"
+          else
+            image_tag="sha-${SOURCE_SHA:0:7}"
+          fi
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Refusing unexpected source SHA" >&2; exit 1; }
+          [[ "$image_tag" == "sha-${SOURCE_SHA:0:7}" ]] || { echo "Image tag/source SHA mismatch" >&2; exit 1; }
+          echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "Deploying $image_tag from $SOURCE_SHA to $BUZZ_EC2_INSTANCE_ID"
+
+      - name: Assume narrowly scoped AWS deployment role via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ env.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: buzz-relay-deploy-${{ github.run_id }}
+
+      - name: Deploy through Systems Manager
+        shell: bash
+        env:
+          IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          SOURCE_SHA: ${{ steps.image.outputs.sha }}
+        run: |
+          set -euo pipefail
+          PARAMS=$(python3 - <<'PY'
+          import json, os
+          tag = os.environ["IMAGE_TAG"]
+          sha = os.environ["SOURCE_SHA"]
+          repo = f"https://raw.githubusercontent.com/davidh03/buzz/{sha}"
+          commands = [
+              "set -euo pipefail",
+              "install -d -o root -g root -m 0755 /opt/buzz",
+              f"curl -fsSL {repo}/deploy/compose/compose.yml -o /opt/buzz/compose.yml",
+              f"curl -fsSL {repo}/deploy/compose/compose.caddy.yml -o /opt/buzz/compose.caddy.yml",
+              f"curl -fsSL {repo}/deploy/ec2/compose.pair.yml -o /opt/buzz/compose.pair.yml",
+              f"curl -fsSL {repo}/deploy/ec2/compose.minio-mirror.yml -o /opt/buzz/compose.minio-mirror.yml",
+              f"curl -fsSL {repo}/deploy/ec2/Caddyfile -o /opt/buzz/Caddyfile",
+              f"curl -fsSL {repo}/deploy/ec2/deploy.sh -o /opt/buzz/deploy.sh",
+              "chmod 0755 /opt/buzz/deploy.sh",
+              f"/opt/buzz/deploy.sh {tag}",
+          ]
+          print(json.dumps({"commands": commands}, separators=(",", ":")))
+          PY
+          )
+          command_id=$(aws ssm send-command \
+            --region "$AWS_REGION" \
+            --instance-ids "$BUZZ_EC2_INSTANCE_ID" \
+            --document-name AWS-RunShellScript \
+            --comment "Buzz deploy $IMAGE_TAG from davidh03/buzz main" \
+            --timeout-seconds 1200 \
+            --parameters "$PARAMS" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM command: $command_id"
+          status=Pending
+          for _ in $(seq 1 120); do
+            status=$(aws ssm get-command-invocation --region "$AWS_REGION" \
+              --command-id "$command_id" --instance-id "$BUZZ_EC2_INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || true)
+            case "$status" in
+              Success) break ;;
+              Failed|Cancelled|TimedOut|Undeliverable|Terminated)
+                aws ssm get-command-invocation --region "$AWS_REGION" \
+                  --command-id "$command_id" --instance-id "$BUZZ_EC2_INSTANCE_ID" \
+                  --query '{Status:Status,Code:ResponseCode,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' --output json
+                exit 1 ;;
+            esac
+            sleep 5
+          done
+          if [[ "$status" != "Success" ]]; then
+            echo "SSM deployment did not complete; last status=$status" >&2
+            exit 1
+          fi
+          aws ssm get-command-invocation --region "$AWS_REGION" \
+            --command-id "$command_id" --instance-id "$BUZZ_EC2_INSTANCE_ID" \
+            --query '{Status:Status,Stdout:StandardOutputContent,Stderr:StandardErrorContent}' --output json
