@@ -493,6 +493,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   push-gateway-build:
+    # This job publishes to ghcr.io/block/*; forks only need the relay image.
+    if: github.repository == 'block/buzz'
     name: Build public push gateway (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -604,7 +606,7 @@ jobs:
 
   push-gateway-merge:
     name: Publish public push gateway image
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.repository == 'block/buzz'
     runs-on: ubuntu-24.04
     needs: push-gateway-build
     timeout-minutes: 15
