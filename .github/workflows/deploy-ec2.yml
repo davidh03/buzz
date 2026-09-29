@@ -5,6 +5,16 @@ on:
     workflows: ["Docker image"]
     types: [completed]
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Published GHCR image tag, for example sha-abcdef0
+        required: true
+        type: string
+      source_sha:
+        description: Full 40-character source commit SHA for that image tag
+        required: true
+        type: string
 
 permissions: {}
 
@@ -16,9 +26,10 @@ jobs:
   deploy:
     if: >-
       ${{ vars.BUZZ_DEPLOY_ENABLED == 'true' &&
-          github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.head_branch == 'main' &&
-          github.event.workflow_run.head_repository.full_name == github.repository }}
+          ((github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+           (github.event.workflow_run.conclusion == 'success' &&
+            github.event.workflow_run.head_branch == 'main' &&
+            github.event.workflow_run.head_repository.full_name == github.repository)) }}
     runs-on: ubuntu-24.04
     permissions:
       id-token: write
@@ -27,7 +38,8 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
       BUZZ_EC2_INSTANCE_ID: ${{ vars.BUZZ_EC2_INSTANCE_ID }}
-      SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+      SOURCE_SHA: ${{ github.event.workflow_run.head_sha || inputs.source_sha }}
+      MANUAL_IMAGE_TAG: ${{ inputs.image_tag }}
     steps:
       - name: Validate deployment settings and image tag
         id: image
@@ -37,10 +49,15 @@ jobs:
           test -n "$AWS_REGION"
           test -n "$AWS_DEPLOY_ROLE_ARN"
           test -n "$BUZZ_EC2_INSTANCE_ID"
-          [[ "$GITHUB_EVENT_NAME" == "workflow_run" ]] || { echo "Only successful main Docker image runs deploy" >&2; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            image_tag="$MANUAL_IMAGE_TAG"
+          else
+            image_tag="sha-${SOURCE_SHA:0:7}"
+          fi
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "Refusing unexpected source SHA" >&2; exit 1; }
-          image_tag="sha-${SOURCE_SHA:0:7}"
+          [[ "$image_tag" == "sha-${SOURCE_SHA:0:7}" ]] || { echo "Image tag/source SHA mismatch" >&2; exit 1; }
           echo "tag=$image_tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "Deploying $image_tag from $SOURCE_SHA to $BUZZ_EC2_INSTANCE_ID"
 
       - name: Assume narrowly scoped AWS deployment role via OIDC
@@ -54,6 +71,7 @@ jobs:
         shell: bash
         env:
           IMAGE_TAG: ${{ steps.image.outputs.tag }}
+          SOURCE_SHA: ${{ steps.image.outputs.sha }}
         run: |
           set -euo pipefail
           PARAMS=$(python3 - <<'PY'
