@@ -80,7 +80,7 @@ jobs:
           sha = os.environ["SOURCE_SHA"]
           repo = f"https://raw.githubusercontent.com/davidh03/buzz/{sha}"
           commands = [
-              "set -euo pipefail",
+              "set -eu",
               "install -d -o root -g root -m 0755 /opt/buzz",
               f"curl -fsSL {repo}/deploy/compose/compose.yml -o /opt/buzz/compose.yml",
               f"curl -fsSL {repo}/deploy/compose/compose.caddy.yml -o /opt/buzz/compose.caddy.yml",
